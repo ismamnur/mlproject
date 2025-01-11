@@ -1,0 +1,3 @@
+[submodule "external_repos/lmms-finetune"]
+	path = external_repos/lmms-finetune
+	url = https://github.com/ismamnur/lmms-finetune
