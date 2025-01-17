@@ -1,48 +1,60 @@
-from langgraph.graph import END, StateGraph, START
-from src.components.data_retrieval import retrieve_documents
-from src.components.data_summarization import summarize_documents_with_llm
-from src.components.wikipedia_search import wiki_search
-from langchain_core.prompts import ChatPromptTemplate
+# src/pipeline/rag_workflow.py
 from langchain_core.pydantic_v1 import BaseModel, Field
-from typing import Literal, List, TypedDict
+from typing import Literal, List
+from typing_extensions import TypedDict
+from langgraph.graph import END, StateGraph, START
+from src.components.retriever import retrieve_documents
+from src.components.summarizer import summarize_state
+from src.components.embeddings import retriever
+from langchain_community.utilities import WikipediaAPIWrapper
+from langchain_community.tools import WikipediaQueryRun
 
-# Define the state schema using TypedDict
+# Wikipedia setup
+wiki_api_wrapper = WikipediaAPIWrapper(top_k_results=10, doc_content_chars_max=200)
+wiki = WikipediaQueryRun(api_wrapper=wiki_api_wrapper)
+
 class GraphState(TypedDict):
-    """Represents the state of the RAG workflow."""
     question: str
     summarized_answer: str
-    documents: List[str]  # Adjust type based on your document structure
+    documents: List[str]
 
+def route_question(state):
+    print("---ROUTE QUESTION---")
+    question = state["question"]
+    source = retriever.invoke({"question": question})
+    return "wiki_search" if source.datasource == "wiki_search" else "vectorstore"
 
-class RouteQuery(BaseModel):
-    datasource: Literal["vectorstore", "wiki_search"] = Field(
-        ..., description="Route a user query to either the vectorstore or Wikipedia search."
-    )
+def wiki_search(state):
+    print("---WIKIPEDIA SEARCH---")
+    question = state["question"]
+    docs = wiki.invoke({"query": question})
+    wiki_results = [Document(page_content=docs)] if docs else []
+    return {"documents": wiki_results, "question": question}
 
+def summarize_wiki_state(state):
+    print("---SUMMARIZE WIKI---")
+    documents = state.get("documents", [])
+    if not documents:
+        return {"summarized_answer": "No relevant Wikipedia results found.", "documents": documents}
+    summarized_answer = summarize_documents_with_chatgroq(documents)
+    return {"summarized_answer": summarized_answer, "documents": documents}
 
-def init_workflow(retriever, llm, wikipedia_tool):
-    """Initialize the workflow."""
-    workflow = StateGraph(GraphState)  # ✅ Fix: Using TypedDict instead of dict
+# Workflow Definition
+workflow = StateGraph(GraphState)
+workflow.add_node("wiki_search", wiki_search)
+workflow.add_node("retrieve_documents", retrieve_documents)
+workflow.add_node("summarize_state", summarize_state)
+workflow.add_node("summarize_wiki_state", summarize_wiki_state)
 
-    def route_question(state: GraphState):
-        question = state["question"]
-        source = route_prompt | structured_llm_router.invoke({"question": question})
-        return "wiki_search" if source.datasource == "wiki_search" else "retrieve_documents"
+workflow.add_conditional_edges(
+    START,
+    route_question,
+    {"wiki_search": "wiki_search", "vectorstore": "retrieve_documents"},
+)
 
-    def summarize_state(state: GraphState):
-        documents = state.get("documents", [])
-        if not documents:
-            return {"summarized_answer": "No relevant documents found.", "documents": documents}
-        return {"summarized_answer": summarize_documents_with_llm(llm, documents), "documents": documents}
+workflow.add_edge("retrieve_documents", "summarize_state")
+workflow.add_edge("summarize_state", END)
+workflow.add_edge("wiki_search", "summarize_wiki_state")
+workflow.add_edge("summarize_wiki_state", END)
 
-    workflow.add_node("wiki_search", lambda state: wiki_search(wikipedia_tool, state["question"]))
-    workflow.add_node("retrieve_documents", lambda state: retrieve_documents(retriever, state["question"]))
-    workflow.add_node("summarize_state", summarize_state)
-
-    workflow.add_edge(START, "retrieve_documents", condition=lambda state: route_question(state) == "retrieve_documents")
-    workflow.add_edge(START, "wiki_search", condition=lambda state: route_question(state) == "wiki_search")
-    workflow.add_edge("retrieve_documents", "summarize_state")
-    workflow.add_edge("wiki_search", "summarize_state")
-    workflow.add_edge("summarize_state", END)
-
-    return workflow
+app = workflow.compile()
