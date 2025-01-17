@@ -1,3 +1,6 @@
+# 
+
+
 import os
 import cassio
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -10,22 +13,22 @@ from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_community.utilities import WikipediaAPIWrapper
 from langchain_community.tools import WikipediaQueryRun
 from langgraph.graph import END, StateGraph, START
-from typing import Literal, List
+from typing import Literal, List, Dict
 from typing_extensions import TypedDict
 from langchain.schema import Document
 from pprint import pprint
 from langchain_groq import ChatGroq
 
 # Set up environment variables
-ASTRA_DB_APPLICATION_TOKEN = "your_astra_token_here"
-ASTRA_DB_ID = "your_astra_db_id_here"
+ASTRA_DB_APPLICATION_TOKEN="xxx"
+ASTRA_DB_ID="xxx"
 cassio.init(token=ASTRA_DB_APPLICATION_TOKEN, database_id=ASTRA_DB_ID)
 
-groq_api_key = "your_groq_api_key_here"
+groq_api_key = "xxx"
 os.environ["GROQ_API_KEY"] = groq_api_key
 
 # Load text data
-loader = TextLoader("DERMNET.md")
+loader = TextLoader("xxx")
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0)
 doc_splits = text_splitter.split_documents(loader.load())
 
@@ -37,11 +40,10 @@ astra_vector_store = Cassandra(
     session=None,
     keyspace=None
 )
-
-retriever = astra_vector_store.as_retriever()
+retriever = astra_vector_store.as_retriever(search_kwargs={"return_similarities": True})
 
 # Wikipedia API Wrapper
-wiki_api_wrapper = WikipediaAPIWrapper(top_k_results=10, doc_content_chars_max=200)
+wiki_api_wrapper = WikipediaAPIWrapper(top_k_results=10, doc_content_chars_max=100)
 wiki = WikipediaQueryRun(api_wrapper=wiki_api_wrapper)
 
 # Data model for routing
@@ -66,49 +68,85 @@ question_router = route_prompt | structured_llm_router
 class GraphState(TypedDict):
     question: str
     summarized_answer: str
-    documents: List[str]
+    documents: List[Document]
 
-def route_question(state):
+def route_question(state: Dict) -> str:
     question = state["question"]
     source = question_router.invoke({"question": question})
     return "wiki_search" if source.datasource == "wiki_search" else "vectorstore"
 
-def summarize_documents_with_chatgroq(documents):
+def retrieve_documents(state: Dict) -> Dict:
+    results = retriever.invoke(state["question"])
+    
+    # Extract documents and similarity scores
+    documents = [doc for doc, score in results]
+    similarity_scores = [score for doc, score in results]
+    
+    # Check if any document has a similarity score above the threshold (0.5)
+    max_similarity = max(similarity_scores) if similarity_scores else 0
+    print(f"max_similarity : {max_similarity}")
+    if max_similarity < 0.5:
+        return {"documents": [], "question": state["question"], "retrieval_attempt": "vectorstore"}
+    
+    return {"documents": documents, "question": state["question"]}
+
+def wiki_search(state: Dict) -> Dict:
+    docs = wiki.invoke({"query": state["question"]})
+    return {"documents": [Document(page_content=docs)] if docs else [], "question": state["question"], "retrieval_attempt": "wiki"}
+
+def check_relevance(state: Dict) -> Dict:
+    documents = state.get("documents", [])
+    
+    # If no relevant documents found in vector store, fallback to Wikipedia search
+    if not documents:
+        return {"next_step": "wiki_search" if state.get("retrieval_attempt", "vectorstore") == "vectorstore" else "rewrite_query"}
+    
+    return {"next_step": "generate_answer"}
+
+def rewrite_query(state: Dict) -> Dict:
+    rewritten_prompt = f"Rewrite the following query for better search results: {state['question']}"
+    new_question = llm.invoke(rewritten_prompt)
+    return {"question": new_question}
+
+def generate_answer(state: Dict) -> Dict:
+    documents = state.get("documents", [])
+    
+    if not documents:
+        return {"summarized_answer": "No relevant documents found.", "documents": []}
+    
     content = "\n\n".join([doc.page_content for doc in documents])
     summarization_prompt = f"""
     Summarize the following information:
     {content}
     """
-    return llm.invoke(summarization_prompt)
-
-def retrieve_documents(state):
-    documents = retriever.invoke(state["question"])
-    return {"documents": documents, "question": state["question"]}
-
-def wiki_search(state):
-    docs = wiki.invoke({"query": state["question"]})
-    return {"documents": [Document(page_content=docs)] if docs else [], "question": state["question"]}
-
-def summarize_state(state):
-    documents = state.get("documents", [])
-    return {"summarized_answer": summarize_documents_with_chatgroq(documents) if documents else "No relevant documents found.", "documents": documents}
-
-def summarize_wiki_state(state):
-    documents = state.get("documents", [])
-    return {"summarized_answer": summarize_documents_with_chatgroq(documents) if documents else "No relevant Wikipedia results found.", "documents": documents}
+    return {"summarized_answer": llm.invoke(summarization_prompt), "documents": documents}
 
 # Define workflow
 graph = StateGraph(GraphState)
 graph.add_node("wiki_search", wiki_search)
 graph.add_node("retrieve_documents", retrieve_documents)
-graph.add_node("summarize_state", summarize_state)
-graph.add_node("summarize_wiki_state", summarize_wiki_state)
+graph.add_node("check_relevance", check_relevance)
+graph.add_node("rewrite_query", rewrite_query)
+graph.add_node("generate_answer", generate_answer)
+
 graph.add_conditional_edges(START, route_question, {"wiki_search": "wiki_search", "vectorstore": "retrieve_documents"})
-graph.add_edge("retrieve_documents", "summarize_state")
-graph.add_edge("summarize_state", END)
-graph.add_edge("wiki_search", "summarize_wiki_state")
-graph.add_edge("summarize_wiki_state", END)
+graph.add_edge("retrieve_documents", "check_relevance")
+
+graph.add_edge("wiki_search", "check_relevance")
+graph.add_conditional_edges("check_relevance", lambda state: state["next_step"], {"rewrite_query": "rewrite_query", "wiki_search": "wiki_search", "generate_answer": "generate_answer"})
+graph.add_edge("rewrite_query", "retrieve_documents")
+graph.add_edge("generate_answer", END)
+
 app = graph.compile()
+
+from IPython.display import Image, display
+
+try:
+    display(Image(app.get_graph().draw_mermaid_png()))
+except Exception:
+    # This requires some extra dependencies and is optional
+    pass
+
 
 # Example query execution
 if __name__ == "__main__":
